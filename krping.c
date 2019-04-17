@@ -85,6 +85,7 @@ static const struct krping_option krping_opts[] = {
  	{"local_dma_lkey", OPT_NOPARAM, 'Z'},
  	{"read_inv", OPT_NOPARAM, 'R'},
  	{"fr", OPT_NOPARAM, 'f'},
+	{"foo", OPT_NOPARAM, 'F'},
 	{NULL, 0, 0}
 };
 
@@ -757,6 +758,34 @@ static void krping_format_send(struct krping_cb *cb, u64 buf)
 	}
 }
 
+static void krping_test_foo_server(struct krping_cb *cb)
+{
+	const struct ib_send_wr *bad_wr;
+	int ret;
+
+	while (1) {
+		/* Wait for client's Start STAG/TO/Len */
+		wait_event_interruptible(cb->sem, cb->state >= RDMA_READ_ADV);
+		if (cb->state != RDMA_READ_ADV) {
+			printk(KERN_ERR PFX "wait for RDMA_READ_ADV state %d\n",
+				cb->state);
+			break;
+		}
+
+		pr_debug("ping iteration %u\n", cb->recv_buf.rkey);
+
+		cb->state = CONNECTED;
+
+		/* Tell client to begin again */
+		ret = ib_post_send(cb->qp, &cb->sq_wr, &bad_wr);
+		if (ret) {
+			printk(KERN_ERR PFX "post send error %d\n", ret);
+			break;
+		}
+		pr_debug("server posted go ahead\n");
+	}
+}
+
 static void krping_test_server(struct krping_cb *cb)
 {
 	const struct ib_send_wr *bad_wr;
@@ -1413,6 +1442,49 @@ static int krping_bind_server(struct krping_cb *cb)
 	return 0;
 }
 
+static void krping_run_foo_server(struct krping_cb *cb)
+{
+	const struct ib_recv_wr *bad_wr;
+	int ret;
+
+	ret = krping_bind_server(cb);
+	if (ret)
+		return;
+
+	ret = krping_setup_qp(cb, cb->child_cm_id);
+	if (ret) {
+		printk(KERN_ERR PFX "setup_qp failed: %d\n", ret);
+		goto err_destroy_id;
+	}
+
+	ret = krping_setup_buffers(cb);
+	if (ret) {
+		printk(KERN_ERR PFX "krping_setup_buffers failed: %d\n", ret);
+		goto err_free_qp;
+	}
+
+	ret = ib_post_recv(cb->qp, &cb->rq_wr, &bad_wr);
+	if (ret) {
+		printk(KERN_ERR PFX "ib_post_recv failed: %d\n", ret);
+		goto err_free_bufs;
+	}
+
+	ret = krping_accept(cb);
+	if (ret) {
+		printk(KERN_ERR PFX "connect error %d\n", ret);
+		goto err_free_bufs;
+	}
+
+	krping_test_foo_server(cb);
+	rdma_disconnect(cb->child_cm_id);
+err_free_bufs:
+	krping_free_buffers(cb);
+err_free_qp:
+	krping_free_qp(cb);
+err_destroy_id:
+	rdma_destroy_id(cb->child_cm_id);
+}
+
 static void krping_run_server(struct krping_cb *cb)
 {
 	const struct ib_recv_wr *bad_wr;
@@ -1535,6 +1607,42 @@ static void krping_test_client(struct krping_cb *cb)
 #ifdef SLOW_KRPING
 		wait_event_interruptible_timeout(cb->sem, cb->state == ERROR, HZ);
 #endif
+	}
+}
+
+static void krping_test_foo_client(struct krping_cb *cb)
+{
+	int ping, ret;
+	const struct ib_send_wr *bad_wr;
+
+	for (ping = 0; !cb->count || ping < cb->count; ping++) {
+		cb->state = RDMA_READ_ADV;
+
+		cb->send_buf.buf = 0xcafebabedeadbeef;
+		cb->send_buf.rkey= ping;
+		cb->send_buf.size = cb->size;
+
+		if (cb->state == ERROR) {
+			printk(KERN_ERR PFX "krping_format_send failed\n");
+			break;
+		}
+		ret = ib_post_send(cb->qp, &cb->sq_wr, &bad_wr);
+		if (ret) {
+			printk(KERN_ERR PFX "post send error %d\n", ret);
+			break;
+		}
+
+		/* Wait for server to ACK */
+		wait_event_interruptible(cb->sem, cb->state >= RDMA_WRITE_ADV);
+		if (cb->state != RDMA_WRITE_ADV) {
+			printk(KERN_ERR PFX 
+			       "wait for RDMA_WRITE_ADV state %d\n",
+			       cb->state);
+			break;
+		}
+
+		pr_debug("pause...\n");
+		wait_event_interruptible_timeout(cb->sem, cb->state == ERROR, HZ);
 	}
 }
 
@@ -1899,6 +2007,54 @@ static int krping_bind_client(struct krping_cb *cb)
 	return 0;
 }
 
+static void krping_run_foo_client(struct krping_cb *cb)
+{
+	const struct ib_recv_wr *bad_wr;
+	int ret;
+
+	/* set type of service, if any */
+	if (cb->tos != 0)
+		rdma_set_service_type(cb->cm_id, cb->tos);
+
+	ret = krping_bind_client(cb);
+	if (ret)
+		return;
+
+	ret = krping_setup_qp(cb, cb->cm_id);
+	if (ret) {
+		printk(KERN_ERR PFX "setup_qp failed: %d\n", ret);
+		return;
+	}
+
+	ret = krping_setup_buffers(cb);
+	if (ret) {
+		printk(KERN_ERR PFX "krping_setup_buffers failed: %d\n", ret);
+		goto err_free_qp;
+	}
+
+	ret = ib_post_recv(cb->qp, &cb->rq_wr, &bad_wr);
+	if (ret) {
+		printk(KERN_ERR PFX "ib_post_recv failed: %d\n", ret);
+		goto err_free_bufs;
+	}
+
+	ret = krping_connect_client(cb);
+	if (ret) {
+		printk(KERN_ERR PFX "connect error %d\n", ret);
+		goto err_free_qp;
+	}
+
+	krping_test_foo_client(cb);
+
+	pr_debug("FOO: Disconnecting!\n");
+
+	rdma_disconnect(cb->cm_id);
+err_free_bufs:
+	krping_free_buffers(cb);
+err_free_qp:
+	krping_free_qp(cb);
+}
+
 static void krping_run_client(struct krping_cb *cb)
 {
 	const struct ib_recv_wr *bad_wr;
@@ -1961,6 +2117,7 @@ int krping_doit(char *cmd)
 	char *optarg;
 	char *scope;
 	unsigned long optint;
+	int foo = 0;
 
 	cb = kzalloc(sizeof(*cb), GFP_KERNEL);
 	if (!cb)
@@ -1979,6 +2136,10 @@ int krping_doit(char *cmd)
 	while ((op = krping_getopt("krping", &cmd, krping_opts, NULL, &optarg,
 			      &optint)) != 0) {
 		switch (op) {
+		case 'F':
+			foo = 1;
+			pr_debug("FOO!!!\n");
+			break;
 		case 'a':
 			cb->addr_str = optarg;
 			in4_pton(optarg, -1, cb->addr, -1, NULL);
@@ -2120,10 +2281,17 @@ int krping_doit(char *cmd)
 	}
 	pr_debug("created cm_id %p\n", cb->cm_id);
 
-	if (cb->server)
-		krping_run_server(cb);
-	else
-		krping_run_client(cb);
+	if (cb->server) {
+		if (foo)
+			krping_run_foo_server(cb);
+		else
+			krping_run_server(cb);
+	} else {
+		if (foo)
+			krping_run_foo_client(cb);
+		else
+			krping_run_client(cb);
+	}
 
 	pr_debug("destroy cm_id %p\n", cb->cm_id);
 	rdma_destroy_id(cb->cm_id);
